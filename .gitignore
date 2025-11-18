@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual envs
+.venv/
+venv/
+
+# IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Project runtime dirs
+captures/
+calibration/
+configs/
+logs/
