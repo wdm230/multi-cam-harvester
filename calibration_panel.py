@@ -20,6 +20,10 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
     QMessageBox,
+    QSizePolicy,
+    QScrollArea,
+    QSizePolicy,
+    QHeaderView,
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 
@@ -110,6 +114,7 @@ class CalibrationPanel(QWidget):
         self.get_frame = get_frame_callable  # function returning np.ndarray or None
 
         # Internal state
+        self.setMinimumSize(700, 800)
         self._captures = []          # list of dicts: image_path, corners, ids, used, error
         self._dictionary = None
         self._board = None
@@ -124,11 +129,24 @@ class CalibrationPanel(QWidget):
         self._calib_worker = None
         self._last_used_indices = []
         self._build_ui()
+        
 
     # ------------------------------------------------------------------ UI ---
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        # Outer layout for this widget
+        outer_layout = QVBoxLayout(self)
+
+        # Scroll area so the whole panel is scrollable
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        outer_layout.addWidget(scroll)
+
+        # Container inside the scroll area
+        container = QWidget()
+        scroll.setWidget(container)
+
+        layout = QVBoxLayout(container)
 
         # --- Board settings --------------------------------------------------
         board_box = QGroupBox("ChArUco Board")
@@ -143,19 +161,18 @@ class CalibrationPanel(QWidget):
         self.squares_y_spin.setValue(4)
 
         self.square_size_spin = QDoubleSpinBox()
-        self.square_size_spin.setRange(0.1, 1000.0)
+        self.square_size_spin.setRange(0.1, 10000.0)
         self.square_size_spin.setDecimals(3)
         self.square_size_spin.setValue(25.4)  # mm
         self.square_size_spin.setSuffix(" mm")
 
         self.marker_size_spin = QDoubleSpinBox()
-        self.marker_size_spin.setRange(0.1, 1000.0)
+        self.marker_size_spin.setRange(0.1, 10000.0)
         self.marker_size_spin.setDecimals(3)
         self.marker_size_spin.setValue(20.32)  # mm
         self.marker_size_spin.setSuffix(" mm")
 
         self.dict_combo = QComboBox()
-        # Include all the ones you actually use; default to 6x6
         self.dict_combo.addItems([
             "DICT_6X6_250",
             "DICT_6X6_1000",
@@ -167,7 +184,7 @@ class CalibrationPanel(QWidget):
 
         self.min_corners_spin = QSpinBox()
         self.min_corners_spin.setRange(4, 500)
-        self.min_corners_spin.setValue(8)  # more forgiving default
+        self.min_corners_spin.setValue(8)
 
         board_form.addRow("Squares (X):", self.squares_x_spin)
         board_form.addRow("Squares (Y):", self.squares_y_spin)
@@ -187,13 +204,13 @@ class CalibrationPanel(QWidget):
         self.capture_mode_combo.addItems(["Timed", "Manual"])
 
         self.interval_spin = QDoubleSpinBox()
-        self.interval_spin.setRange(0.1, 10.0)
+        self.interval_spin.setRange(0.1, 60.0)
         self.interval_spin.setDecimals(2)
         self.interval_spin.setValue(1.0)
         self.interval_spin.setSuffix(" s")
 
         self.max_images_spin = QSpinBox()
-        self.max_images_spin.setRange(0, 1000)
+        self.max_images_spin.setRange(0, 10000)
         self.max_images_spin.setValue(0)  # 0 = unlimited
 
         btn_row = QHBoxLayout()
@@ -233,7 +250,18 @@ class CalibrationPanel(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setStretchLastSection(True)
+
+        # Make the captured-images section nice and tall
+        self.table.setMinimumHeight(450)
+        table_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # Make columns narrow enough to fit without horizontal scroll
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # "#"
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # "Corners"
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # "Used"
+        header.setSectionResizeMode(3, QHeaderView.Stretch)           # "Error (px)" fills the rest
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         table_buttons = QHBoxLayout()
         self.import_btn = QPushButton("Import folder...")
@@ -252,7 +280,8 @@ class CalibrationPanel(QWidget):
         table_layout.addWidget(self.table)
         table_layout.addLayout(table_buttons)
         table_box.setLayout(table_layout)
-        layout.addWidget(table_box)
+        # Give this group extra stretch so it gets more space than the top boxes
+        layout.addWidget(table_box, 2)
 
         # --- Calibration & results ------------------------------------------
         calib_box = QGroupBox("Calibration")
@@ -267,6 +296,7 @@ class CalibrationPanel(QWidget):
         # Matplotlib canvas for per-image errors
         self.fig, self.ax = plt.subplots(figsize=(4, 4))
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setMinimumHeight(450)
 
         btn_row2 = QHBoxLayout()
         btn_row2.addWidget(self.calibrate_btn)
@@ -282,7 +312,10 @@ class CalibrationPanel(QWidget):
         self.calibrate_btn.clicked.connect(self._on_calibrate)
         self.export_btn.clicked.connect(self._on_export)
 
+        # Optional: keep things pushed up a bit
         layout.addStretch(1)
+
+
 
     # --------------------------------------------------------- board setup ---
 

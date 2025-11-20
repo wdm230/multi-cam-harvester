@@ -75,6 +75,11 @@ class HarvesterCameraManager:
 
         # NEW: track last snapshot time for snapshot_fps logic
         self._last_snapshot_time: Optional[float] = None
+        # NEW: track last time we actually wrote a video frame
+        self._last_video_time: Optional[float] = None
+        # NEW: whether the writer expects color frames
+        self._writer_is_color: bool = True
+
 
     # ---- lifetime management ------------------------------------------------
 
@@ -239,7 +244,8 @@ class HarvesterCameraManager:
         self._frame_index = 0
         self._writer = None
         self._recording = True
-        self._last_snapshot_time = None  # NEW: reset when session starts
+        self._last_snapshot_time = None
+        self._last_video_time = None     
 
     def stop_session(self):
         """Stop recording and finalize video writer if any (preview is unaffected)."""
@@ -257,6 +263,8 @@ class HarvesterCameraManager:
         self._recording = False
         self._session_cfg = None
         self._last_snapshot_time = None
+        self._last_video_time = None     # NEW
+
 
     # ---- acquisition --------------------------------------------------------
 
@@ -283,7 +291,10 @@ class HarvesterCameraManager:
 
         height, width = img.shape[:2]
 
-        # Choose extension + fourcc based on codec
+        # Most codecs expect 3-channel BGR, so we configure the writer that way.
+        self._writer_is_color = True
+        frame_size = (width, height)
+
         codec = (self._session_cfg.video_codec or "XVID").upper()
 
         if codec == "MP4V":
@@ -293,19 +304,40 @@ class HarvesterCameraManager:
             ext = ".avi"
             fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         else:
+            # Default / unknown → XVID AVI
             codec = "XVID"
             ext = ".avi"
             fourcc = cv2.VideoWriter_fourcc(*"XVID")
 
-        video_path = self._session_cfg.session_dir / f"{self._session_cfg.session_id}{ext}"
+        base_path = self._session_cfg.session_dir / f"{self._session_cfg.session_id}{ext}"
 
-        self._writer = cv2.VideoWriter(
-            str(video_path),
+        writer = cv2.VideoWriter(
+            str(base_path),
             fourcc,
             float(self._session_cfg.video_fps),
-            (width, height),
-            isColor=img.ndim == 3 and img.shape[2] == 3,
+            frame_size,
+            isColor=self._writer_is_color,
         )
+
+        # If requested codec fails (common for XVID if codec isn't installed), fallback to MJPG AVI.
+        if not writer.isOpened():
+            fallback_path = self._session_cfg.session_dir / f"{self._session_cfg.session_id}_MJPG.avi"
+            fallback_fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            writer = cv2.VideoWriter(
+                str(fallback_path),
+                fallback_fourcc,
+                float(self._session_cfg.video_fps),
+                frame_size,
+                isColor=self._writer_is_color,
+            )
+            if not writer.isOpened():
+                # Give up on video; leave snapshots working
+                self._writer = None
+                self._session_cfg.record_video = False
+                return
+
+        self._writer = writer
+
 
 
     def fetch_next(self, timeout: float = 0.5) -> Optional[np.ndarray]:
@@ -339,32 +371,25 @@ class HarvesterCameraManager:
             # Lazy-init writer
             self._ensure_writer(img)
 
-            # Write video if we're recording
-            if self._writer is not None:
-                try:
-                    self._writer.write(img)
-                except Exception:
-                    # Don't kill preview if writer glitches
-                    pass
-
-            # Snapshots (time-based, using snapshot_fps)
-            if self._recording and self._session_cfg:
-                self._frame_index += 1
-                fps = float(self._session_cfg.snapshot_fps)
+            # Write video if we're recording, but honor video_fps using wall-clock time
+            if self._writer is not None and self._session_cfg and self._session_cfg.record_video:
+                fps = float(self._session_cfg.video_fps)
                 if fps > 0.0:
                     now = time.time()
                     interval = 1.0 / fps
-                    if self._last_snapshot_time is None or (now - self._last_snapshot_time) >= interval:
-                        self._last_snapshot_time = now
-                        snap_path = (
-                            self._session_cfg.session_dir
-                            / f"{self._session_cfg.session_id}_frame_{self._frame_index:06d}.png"
-                        )
-                        try:
-                            cv2.imwrite(str(snap_path), img)
-                        except Exception:
-                            pass
+                    if self._last_video_time is None or (now - self._last_video_time) >= interval:
+                        self._last_video_time = now
 
+                        frame_out = img
+                        # If writer expects color but image is mono, convert
+                        if self._writer_is_color and (img.ndim == 2 or img.shape[2] == 1):
+                            frame_out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+                        try:
+                            self._writer.write(frame_out)
+                        except Exception:
+                            # Don't kill preview if writer glitches
+                            pass
             return img
         finally:
             # Queue buffer back to the producer for reuse

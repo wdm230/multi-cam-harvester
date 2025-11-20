@@ -13,7 +13,7 @@ venv/
 .vscode/
 .idea/
 *.code-workspace
-
+.vs/
 # OS noise
 .DS_Store
 Thumbs.db
@@ -23,3 +23,15 @@ captures/
 calibration/
 configs/
 logs/
+
+# Ignore all PNG images
+*.png
+
+# Ignore all JSON files
+*.json
+
+# Ignore this specific file
+ruco_test.py
+
+# Ignore all .cti files
+*.cti

@@ -8,7 +8,7 @@ import numpy as np
 def main():
     # --- hard-coded paths ---------------------------------------------------
     calib_json = Path("captures/cam_calib.json")
-    input_image = Path("captures/calibrationSnapshots/charuco_0029.png")
+    input_image = Path(r"captures/calibrationSnapshots/charuco_0222.png")
     output_image = input_image.with_name(input_image.stem + "_undist_compare.png")
 
     # --- load calibration ----------------------------------------------------
@@ -40,11 +40,10 @@ def main():
 
     # --- build side-by-side comparison --------------------------------------
     # Resize to same height just in case (should already match)
-    if undist.shape != img.shape:
-        undist = cv2.resize(undist, (w, h))
+
 
     compare = np.hstack([img, undist])
-
+    cv2.drawChessboardCorners
     cv2.imwrite(str(output_image), compare)
     print(f"[INFO] Saved side-by-side comparison to: {output_image}")
 
