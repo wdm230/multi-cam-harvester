@@ -1,0 +1,14 @@
+name: multi-cam-harvester
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - pyqt          # provides PyQt5 bindings
+  - pip
+  - pip:
+      - opencv-contrib-python
+      - harvesters

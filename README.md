@@ -12,6 +12,25 @@ This project is a small multi-camera GUI + backend for GigE / GenICam cameras us
 It’s built around a single-camera backend (`HarvesterCameraManager` in `backend.py`) and a Qt GUI (`gui_multi.py`) that manages a grid of camera tiles.
 
 ---
+# Installation
+
+Installation can be performed by cloning the directory and running 
+```bash
+conda env create -f environment.yaml
+````
+OR
+
+```bash
+pip install -r requirements.txt
+````
+
+The GUI can then be ran like so:
+
+```bash
+python gui_multi.py
+````
+
+---
 
 ## Hardware & camera support
 
