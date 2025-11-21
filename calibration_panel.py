@@ -1,5 +1,6 @@
 import json
 import datetime
+import time
 
 import cv2
 import numpy as np
@@ -122,6 +123,7 @@ class CalibrationPanel(QWidget):
         self._camera_matrix = None
         self._dist_coeffs = None
         self._rms = None
+        self._live_overlay_enabled = False
 
         # Timer for timed capture
         self._timer = QTimer(self)
@@ -371,9 +373,15 @@ class CalibrationPanel(QWidget):
             self._update_board()
 
     # -------------------------------------------------------- capture flow ---
+    def is_live_overlay_enabled(self) -> bool:
+        """Return True if we should draw live ChArUco overlay on the active camera."""
+        return self._live_overlay_enabled
 
     def _on_start_capture(self):
         mode = self.capture_mode_combo.currentText()
+        # Turn on live overlay whenever we’re in “capture mode”
+        self._live_overlay_enabled = True
+
         if mode == "Manual":
             self._timer.stop()
             self.start_capture_btn.setEnabled(False)
@@ -391,6 +399,9 @@ class CalibrationPanel(QWidget):
         self.start_capture_btn.setEnabled(True)
         self.stop_capture_btn.setEnabled(False)
         self.status_label.setText("Capture stopped.")
+        # Turn off live overlay when we’re done
+        self._live_overlay_enabled = False
+
 
     def _on_capture_now(self):
         ok = self._capture_one()
@@ -490,23 +501,51 @@ class CalibrationPanel(QWidget):
             return False
 
         # ---------------------------------------------------------------------
-        # Save this capture to disk under <current_save_dir>/calibrationSnapshots
+        # Save this capture to disk under <session>/<camera>/calibrationSnapshots
         # ---------------------------------------------------------------------
         parent = self.parent()
-        base_path = None
+        base_dir = None
 
-        if hasattr(parent, "dir_edit"):
-            txt = parent.dir_edit.text().strip()
-            base_path = txt or getattr(parent, "save_path", None)
-        elif hasattr(parent, "save_path"):
-            base_path = parent.save_path
+        if parent is not None and hasattr(parent, "save_dir_edit"):
+            # We are in the multi-camera GUI (MultiCamWindow)
+            root_text = parent.save_dir_edit.text().strip()
+            root_dir = Path(root_text) if root_text else getattr(parent, "save_root", Path("captures")).absolute()
 
-        if not base_path:
-            base_path = "captures"
+            # Try to reuse the current session base (with _0001, _0002, ...)
+            base_id = getattr(parent, "current_session_base", None)
 
-        base_dir = Path(base_path)
+            if base_id is None:
+                # Fall back to the raw session ID text, or timestamp if empty
+                base_text = parent.session_id_edit.text().strip() if hasattr(parent, "session_id_edit") else ""
+                if not base_text:
+                    base_text = time.strftime("%Y%m%d_%H%M%S")
+                base_id = base_text
+
+            cam_id = getattr(parent, "active_camera_id", None)
+            if cam_id:
+                base_dir = root_dir / base_id / cam_id
+            else:
+                # No active camera? Fall back to just the session folder
+                base_dir = root_dir / base_id
+
+        else:
+            # Legacy/single-camera usage: keep the old behavior
+            base_path = None
+
+            if hasattr(parent, "dir_edit"):
+                txt = parent.dir_edit.text().strip()
+                base_path = txt or getattr(parent, "save_path", None)
+            elif hasattr(parent, "save_path"):
+                base_path = parent.save_path
+
+            if not base_path:
+                base_path = "captures"
+
+            base_dir = Path(base_path)
+
         calib_dir = base_dir / "calibrationSnapshots"
         calib_dir.mkdir(parents=True, exist_ok=True)
+
 
         snap_idx = len(self._captures)
         filename = f"charuco_{snap_idx:04d}.png"
@@ -533,6 +572,63 @@ class CalibrationPanel(QWidget):
         self._captures.append(capture)
         self._append_capture_row(capture)
         return True
+
+    def draw_live_charuco_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Given a frame from the active camera, return a copy with live ChArUco
+        detection drawn over it. If detection fails, returns the original frame.
+        """
+        if frame is None:
+            return frame
+
+        vis = frame.copy()
+
+        # Ensure grayscale for detection
+        if vis.ndim == 3 and vis.shape[2] == 3:
+            gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = vis
+
+        h, w = gray.shape[:2]
+
+        # For *preview*, don't be strict about image size.
+        # Optionally just initialize _image_size the first time:
+        if self._image_size is None:
+            self._image_size = (w, h)
+        # But DO NOT early-return on mismatch here
+
+        self._ensure_board()
+        import cv2.aruco as aruco
+
+        params = self._aruco_params()
+        corners, ids, _ = aruco.detectMarkers(gray, self._dictionary, parameters=params)
+
+        if ids is None or len(ids) == 0:
+            return frame  # show raw frame if no markers
+
+        num, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+            corners, ids, gray, self._board
+        )
+
+        min_req = self.min_corners_spin.value()
+        if (
+            charuco_corners is None
+            or charuco_ids is None
+            or num < min_req
+        ):
+            return frame  # again, raw frame only
+
+        # Ensure 3-channel for drawing
+        if vis.ndim == 2:
+            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+        elif vis.ndim == 3 and vis.shape[2] == 1:
+            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+        aruco.drawDetectedMarkers(vis, corners)
+        aruco.drawDetectedCornersCharuco(vis, charuco_corners)
+
+        return vis
+
 
     # ------------------------------------------------------ import folder ----
 

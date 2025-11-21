@@ -18,6 +18,8 @@ venv/
 .DS_Store
 Thumbs.db
 
+ptv_output/
+
 # Project runtime dirs
 captures/
 calibration/

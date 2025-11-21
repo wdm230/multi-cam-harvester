@@ -59,11 +59,18 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QGroupBox,
     QComboBox,
+    QSpinBox,          
+    QDialog,               
+    QDialogButtonBox,
+    QMessageBox,
 )
 
 from backend import HarvesterCameraManager
 from calibration_panel import CalibrationPanel
 from ptv import PTVTracker, PTVConfig
+import subprocess
+import sys
+
 
 try:
     from harvesters.core import Harvester
@@ -389,14 +396,27 @@ class MultiCamWindow(QMainWindow):
         self.cameras: Dict[str, CameraContext] = {}
         self.active_camera_id: Optional[str] = None
 
-        # Global recording/session defaults
         self.save_root: Path = Path("captures").absolute()
         self.session_id_base: str = time.strftime("%Y%m%d_%H%M%S")
+        self.config_data: Dict[str, Any] = self._load_config()
 
-        # Persistent camera names (hardware_id -> label)
+        global_conf = self.config_data.get("global", {})
+        if isinstance(global_conf, dict):
+            root_str = global_conf.get("save_root")
+            if root_str:
+                try:
+                    self.save_root = Path(root_str)
+                except Exception:
+                    pass
+
+            sid = global_conf.get("session_id_base")
+            if sid:
+                self.session_id_base = str(sid)
+
         self.camera_name_map: Dict[str, str] = self._load_camera_names()
+        self.ptv_config: PTVConfig = self._load_ptv_config()
 
-        # Settings widgets
+        self.camera_name_map: Dict[str, str] = self._load_camera_names()
         self.active_cam_label: Optional[QLabel] = None
         self.hardware_id_label: Optional[QLabel] = None
         self.camera_name_edit: Optional[QLineEdit] = None
@@ -485,7 +505,14 @@ class MultiCamWindow(QMainWindow):
         name_form.addRow("Camera name:", name_row)
         s_layout.addLayout(name_form)
 
+        # Pull global config (may be empty)
+        global_conf = self.config_data.get("global", {}) if hasattr(self, "config_data") else {}
+        if not isinstance(global_conf, dict):
+            global_conf = {}
+
+        # ------------------------------------------------------------------
         # Global recording/session settings
+        # ------------------------------------------------------------------
         rec_box = QGroupBox("Recording session (all cameras)")
         rec_form = QFormLayout()
 
@@ -505,7 +532,7 @@ class MultiCamWindow(QMainWindow):
 
         # Record video
         self.record_check = QCheckBox("Record video")
-        self.record_check.setChecked(True)
+        self.record_check.setChecked(bool(global_conf.get("record_video", True)))
         rec_form.addRow("Video:", self.record_check)
 
         # Snapshot FPS (per second)
@@ -513,7 +540,7 @@ class MultiCamWindow(QMainWindow):
         self.snapshot_fps_spin.setRange(0.0, 120.0)
         self.snapshot_fps_spin.setDecimals(1)
         self.snapshot_fps_spin.setSingleStep(0.5)
-        self.snapshot_fps_spin.setValue(0.0)
+        self.snapshot_fps_spin.setValue(float(global_conf.get("snapshot_fps", 0.0)))
         self.snapshot_fps_spin.setToolTip(
             "Snapshots per second per camera while recording (0 = disabled)."
         )
@@ -524,10 +551,8 @@ class MultiCamWindow(QMainWindow):
         self.capture_fps_spin.setRange(0.1, 120.0)
         self.capture_fps_spin.setDecimals(1)
         self.capture_fps_spin.setSingleStep(1.0)
-        self.capture_fps_spin.setValue(30.0)
-        self.capture_fps_spin.setToolTip(
-            "Frame rate written into video files (frames per second)."
-        )
+        self.capture_fps_spin.setValue(float(global_conf.get("capture_fps", 30.0)))
+        self.capture_fps_spin.setToolTip("Video recording frame rate (per camera).")
         rec_form.addRow("Recording FPS:", self.capture_fps_spin)
 
         # Codec
@@ -535,13 +560,37 @@ class MultiCamWindow(QMainWindow):
         self.codec_combo.addItem("XVID (AVI)", "XVID")
         self.codec_combo.addItem("MJPG (AVI)", "MJPG")
         self.codec_combo.addItem("MP4V (MP4)", "MP4V")
-        self.codec_combo.setCurrentIndex(0)
+
+        codec_default = str(global_conf.get("codec", "XVID"))
+        idx = 0
+        for i in range(self.codec_combo.count()):
+            if self.codec_combo.itemData(i) == codec_default:
+                idx = i
+                break
+        self.codec_combo.setCurrentIndex(idx)
         rec_form.addRow("Video codec:", self.codec_combo)
+
+        # Persist global settings when they change
+        self.record_check.toggled.connect(
+            lambda _checked: self._save_global_settings()
+        )
+        self.snapshot_fps_spin.valueChanged.connect(
+            lambda _v: self._save_global_settings()
+        )
+        self.capture_fps_spin.valueChanged.connect(
+            lambda _v: self._save_global_settings()
+        )
+        self.codec_combo.currentIndexChanged.connect(
+            lambda _i: self._save_global_settings()
+        )
+        self.session_id_edit.editingFinished.connect(self._save_global_settings)
 
         rec_box.setLayout(rec_form)
         s_layout.addWidget(rec_box)
 
+        # ------------------------------------------------------------------
         # Per-camera controls
+        # ------------------------------------------------------------------
         cam_box = QGroupBox("Active camera controls")
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
@@ -569,7 +618,9 @@ class MultiCamWindow(QMainWindow):
         self.preview_fps_spin.setRange(0.5, 60.0)
         self.preview_fps_spin.setDecimals(1)
         self.preview_fps_spin.setSingleStep(0.5)
-        self.preview_fps_spin.setValue(PREVIEW_FPS_REAL)
+        self.preview_fps_spin.setValue(
+            float(global_conf.get("preview_fps", PREVIEW_FPS_REAL))
+        )
         self.preview_fps_spin.setToolTip(
             "How often the preview image is updated (frames per second)."
         )
@@ -599,6 +650,7 @@ class MultiCamWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self.calib_dock)
         self.calib_dock.hide()
 
+
     def _build_toolbar(self):
         toolbar = QToolBar("Main Toolbar", self)
         toolbar.setStyleSheet("background: #f5f5f5;")
@@ -624,7 +676,7 @@ class MultiCamWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-                # NEW: Global PTV toggle
+        # Global PTV toggle
         self.ptv_toggle_action = QAction("Start PTV", self)
         self.ptv_toggle_action.setCheckable(True)
         self.ptv_toggle_action.setChecked(False)
@@ -632,15 +684,22 @@ class MultiCamWindow(QMainWindow):
         self.ptv_toggle_action.triggered.connect(self._on_toggle_ptv_all)
         toolbar.addAction(self.ptv_toggle_action)
 
+        # PTV settings dialog
+        self.ptv_settings_action = QAction("PTV Settings...", self)
+        self.ptv_settings_action.setStatusTip("Configure PTV detection/tracking parameters")
+        self.ptv_settings_action.triggered.connect(self._show_ptv_settings)
+        toolbar.addAction(self.ptv_settings_action)
+
         toolbar.addSeparator()
 
-
+        # Snapshot active
         self.snapshot_action = QAction("Snapshot (active)", self)
         self.snapshot_action.setStatusTip("Save a single snapshot from the active camera")
         self.snapshot_action.triggered.connect(self._on_snapshot_active)
         toolbar.addAction(self.snapshot_action)
 
         toolbar.addSeparator()
+
         # Settings dock toggle
         self.settings_action = QAction("Settings", self)
         self.settings_action.setCheckable(True)
@@ -649,14 +708,23 @@ class MultiCamWindow(QMainWindow):
         self.settings_action.toggled.connect(self.settings_dock.setVisible)
         toolbar.addAction(self.settings_action)
 
+        toolbar.addSeparator()
 
+        # Calibration dock toggle
         self.calib_action = QAction("Calibration", self)
         self.calib_action.setCheckable(True)
         self.calib_action.setChecked(False)
         self.calib_action.setStatusTip("Show/hide calibration panel")
         self.calib_action.toggled.connect(self.calib_dock.setVisible)
         toolbar.addAction(self.calib_action)
-        self.calib_dock.visibilityChanged.connect(self.calib_action.setChecked)
+
+        toolbar.addSeparator()
+
+        self.ptv_maker_action = QAction("PTV Maker...", self)
+        self.ptv_maker_action.setStatusTip("Open offline PTV Maker tool")
+        self.ptv_maker_action.triggered.connect(self._launch_ptv_maker)
+        toolbar.addAction(self.ptv_maker_action)
+
 
     def _build_status_bar(self):
         self.status = QStatusBar()
@@ -665,6 +733,17 @@ class MultiCamWindow(QMainWindow):
         self.status.showMessage("Ready (no cameras connected).")
 
     # ---- Camera initialization ----------------------------------------------
+
+    def _friendly_cam_token(self, ctx: CameraContext) -> str:
+        """
+        Return a filesystem-safe token for this camera, preferring the user
+        friendly name and falling back to the internal camera_id.
+        """
+        base = (ctx.name or "").strip() or ctx.camera_id
+        # Replace spaces and weird chars with underscores
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in base)
+        return safe
+
 
     def _init_real_cameras(self):
         """Enumerate real cameras via Harvester and create contexts."""
@@ -812,6 +891,18 @@ class MultiCamWindow(QMainWindow):
             self.grid_layout.setColumnStretch(c, 1)
 
     # ---- Helpers ------------------------------------------------------------
+    def _launch_ptv_maker(self):
+        """
+        Launch ptv_full.py in a separate process.
+        Assumes ptv_full.py is in the same directory as gui_multi.py.
+        """
+        here = Path(__file__).resolve().parent
+        script = here / "ptv_full.py"
+        if not script.exists():
+            QMessageBox.warning(self, "PTV Maker", f"Could not find {script}")
+            return
+        subprocess.Popen([sys.executable, str(script)])
+
 
     def _load_camera_names(self) -> Dict[str, str]:
         """Load persistent camera name mapping from disk."""
@@ -850,14 +941,160 @@ class MultiCamWindow(QMainWindow):
             if self.save_dir_edit is not None:
                 self.save_dir_edit.setText(str(self.save_root))
             self.status.showMessage(f"Save dir: {self.save_root}")
+            self._save_global_settings()
 
     def _session_params(self) -> (Path, str):
         """Return (root_dir, session_id_base) from UI with sensible defaults."""
         root_text = self.save_dir_edit.text().strip() if self.save_dir_edit else ""
         root = Path(root_text) if root_text else self.save_root
+        self.save_root = root
+
         base_text = self.session_id_edit.text().strip() if self.session_id_edit else ""
         base = base_text or time.strftime("%Y%m%d_%H%M%S")
+        self.session_id_base = base
+
+        # Persist latest choices
+        self._save_global_settings()
+
         return root, base
+
+
+    def _show_ptv_settings(self):
+        """Show a modal dialog to tweak PTVConfig fields."""
+        cfg = self.ptv_config
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("PTV Settings")
+        form = QFormLayout(dlg)
+
+        # Integer controls
+        threshold_spin = QSpinBox()
+        threshold_spin.setRange(0, 255)
+        threshold_spin.setValue(int(cfg.threshold))
+
+        max_tracks_spin = QSpinBox()
+        max_tracks_spin.setRange(1, 10000)
+        max_tracks_spin.setValue(int(cfg.max_tracks))
+
+        max_history_spin = QSpinBox()
+        max_history_spin.setRange(1, 1_000_000)
+        max_history_spin.setValue(int(cfg.max_history))
+
+        max_missed_spin = QSpinBox()
+        max_missed_spin.setRange(0, 10_000)
+        max_missed_spin.setValue(int(cfg.max_missed_frames))
+
+        process_every_spin = QSpinBox()
+        process_every_spin.setRange(1, 1000)
+        process_every_spin.setValue(int(cfg.process_every_n_frames))
+
+        # Float controls
+        min_area_spin = QDoubleSpinBox()
+        min_area_spin.setRange(0.0, 1e9)
+        min_area_spin.setDecimals(2)
+        min_area_spin.setSingleStep(1.0)
+        min_area_spin.setValue(float(cfg.min_area))
+
+        max_dist_spin = QDoubleSpinBox()
+        max_dist_spin.setRange(0.0, 1e6)
+        max_dist_spin.setDecimals(2)
+        max_dist_spin.setSingleStep(1.0)
+        max_dist_spin.setValue(float(cfg.max_dist_px))
+
+        downscale_spin = QDoubleSpinBox()
+        downscale_spin.setRange(0.01, 4.0)
+        downscale_spin.setDecimals(2)
+        downscale_spin.setSingleStep(0.05)
+        downscale_spin.setValue(float(cfg.downscale_factor))
+
+        # Layout rows
+        form.addRow("Threshold (0-255):", threshold_spin)
+        form.addRow("Min area (px):", min_area_spin)
+        form.addRow("Max tracks:", max_tracks_spin)
+        form.addRow("Max history length:", max_history_spin)
+        form.addRow("Max jump (px):", max_dist_spin)
+        form.addRow("Max missed frames:", max_missed_spin)
+        form.addRow("Process every Nth frame:", process_every_spin)
+        form.addRow("Downscale factor:", downscale_spin)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        form.addRow(buttons)
+
+        def on_accept():
+            # Push values back into the shared PTVConfig
+            cfg.threshold = int(threshold_spin.value())
+            cfg.min_area = float(min_area_spin.value())
+            cfg.max_tracks = int(max_tracks_spin.value())
+            cfg.max_history = int(max_history_spin.value())
+            cfg.max_dist_px = float(max_dist_spin.value())
+            cfg.max_missed_frames = int(max_missed_spin.value())
+            cfg.process_every_n_frames = int(process_every_spin.value())
+            cfg.downscale_factor = float(downscale_spin.value())
+
+            # Persist to config JSON
+            self._save_ptv_config()
+
+            # Optional: clear tracks when settings change substantially
+            # for ctx in self.cameras.values():
+            #     if ctx.ptv_tracker is not None:
+            #         ctx.ptv_tracker.clear()
+
+            self.status.showMessage("PTV settings updated and saved.", 5000)
+            dlg.accept()
+
+        buttons.accepted.connect(on_accept)
+        buttons.rejected.connect(dlg.reject)
+
+        dlg.exec_()
+
+
+
+    def _next_session_base(self, root: Path, base: str) -> str:
+        """
+        Choose a session base ID with an incrementing suffix (_0001, _0002, ...)
+        so we don't overwrite previous recordings.
+
+        Looks at existing subdirectories under `root` whose names start
+        with `base` and picks the next available index.
+        """
+        existing_indices = []
+
+        if root.exists():
+            for entry in root.iterdir():
+                if not entry.is_dir():
+                    continue
+                name = entry.name
+                if not name.startswith(base):
+                    continue
+
+                suffix = name[len(base):]
+
+                # Exact match (no suffix) -> treat as index 0
+                if not suffix:
+                    existing_indices.append(0)
+                    continue
+
+                if not suffix.startswith("_"):
+                    continue
+
+                # Parse digits after the underscore, ignoring any trailing junk
+                digits = ""
+                for ch in suffix[1:]:
+                    if ch.isdigit():
+                        digits += ch
+                    else:
+                        break
+
+                if digits:
+                    try:
+                        existing_indices.append(int(digits))
+                    except ValueError:
+                        pass
+
+        next_idx = (max(existing_indices) + 1) if existing_indices else 1
+        return f"{base}_{next_idx:04d}"
+
 
     def _get_active_frame(self):
         """For CalibrationPanel: return latest frame of active camera."""
@@ -919,6 +1156,160 @@ class MultiCamWindow(QMainWindow):
                 self.status.showMessage(f"Failed to refresh camera params: {e}")
             self._set_gain_exposure_enabled(False)
 
+
+    # ---- Config / persistence helpers ---------------------------------------
+
+    # ------------------------------------------------------------------
+    # Config / persistence
+    # ------------------------------------------------------------------
+    def _load_config(self) -> Dict[str, Any]:
+        """
+        Load the full GUI config from disk.
+
+        Structure (extensible):
+            {
+              "camera_names": {hardware_id: "Nice name", ...},
+              "ptv": {
+                  "threshold": 200,
+                  ...
+              },
+              "global": {
+                  "save_root": "/path/to/captures",
+                  "session_id_base": "MySession",
+                  "record_video": true,
+                  "snapshot_fps": 0.0,
+                  "capture_fps": 30.0,
+                  "codec": "XVID",
+                  "preview_fps": 10.0
+              }
+            }
+        """
+        try:
+            if CONFIG_PATH.exists():
+                text = CONFIG_PATH.read_text(encoding="utf-8")
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_config(self) -> None:
+        """Write the full config dictionary back to disk."""
+        try:
+            CONFIG_PATH.write_text(
+                json.dumps(self.config_data, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _load_camera_names(self) -> Dict[str, str]:
+        """Extract camera_names from the loaded config."""
+        data = getattr(self, "config_data", None)
+        if not isinstance(data, dict):
+            data = {}
+            self.config_data = data
+
+        names = data.get("camera_names", {})
+        if isinstance(names, dict):
+            return {str(k): str(v) for k, v in names.items()}
+        return {}
+
+    def _save_camera_names(self) -> None:
+        """Update camera_names in config and save."""
+        if not isinstance(self.config_data, dict):
+            self.config_data = {}
+        self.config_data["camera_names"] = self.camera_name_map
+        self._save_config()
+
+    def _load_ptv_config(self) -> PTVConfig:
+        """
+        Build a PTVConfig from the config file, falling back to defaults
+        for anything missing.
+        """
+        base = PTVConfig()  # defaults from ptv.py
+        data = getattr(self, "config_data", {}) or {}
+        ptv = data.get("ptv", {}) or {}
+        if not isinstance(ptv, dict):
+            return base
+
+        # Copy over any recognized fields if present
+        for field in (
+            "threshold",
+            "min_area",
+            "max_tracks",
+            "max_history",
+            "max_dist_px",
+            "max_missed_frames",
+            "process_every_n_frames",
+            "downscale_factor",
+        ):
+            if field in ptv:
+                setattr(base, field, ptv[field])
+
+        return base
+
+    def _save_ptv_config(self) -> None:
+        """Write current PTVConfig fields into config and save."""
+        if not isinstance(self.config_data, dict):
+            self.config_data = {}
+
+        self.config_data["ptv"] = {
+            "threshold": int(self.ptv_config.threshold),
+            "min_area": float(self.ptv_config.min_area),
+            "max_tracks": int(self.ptv_config.max_tracks),
+            "max_history": int(self.ptv_config.max_history),
+            "max_dist_px": float(self.ptv_config.max_dist_px),
+            "max_missed_frames": int(self.ptv_config.max_missed_frames),
+            "process_every_n_frames": int(self.ptv_config.process_every_n_frames),
+            "downscale_factor": float(self.ptv_config.downscale_factor),
+        }
+        self._save_config()
+
+    def _save_global_settings(self) -> None:
+        """
+        Snapshot all the global GUI settings (dirs, session ID, record/snapshot/codec/FPS)
+        into the config and write them out.
+        """
+        if not isinstance(self.config_data, dict):
+            self.config_data = {}
+
+        glob = self.config_data.get("global", {})
+        if not isinstance(glob, dict):
+            glob = {}
+
+        glob["save_root"] = str(self.save_root)
+
+        if self.session_id_edit is not None:
+            glob["session_id_base"] = self.session_id_edit.text().strip() or self.session_id_base
+        else:
+            glob["session_id_base"] = self.session_id_base
+
+        if self.record_check is not None:
+            glob["record_video"] = bool(self.record_check.isChecked())
+
+        if self.snapshot_fps_spin is not None:
+            glob["snapshot_fps"] = float(self.snapshot_fps_spin.value())
+
+        if self.capture_fps_spin is not None:
+            glob["capture_fps"] = float(self.capture_fps_spin.value())
+
+        codec = "XVID"
+        if self.codec_combo is not None:
+            data = self.codec_combo.currentData()
+            if data:
+                codec = str(data)
+        glob["codec"] = codec
+
+        if self.preview_fps_spin is not None:
+            glob["preview_fps"] = float(self.preview_fps_spin.value())
+
+        self.config_data["global"] = glob
+        self._save_config()
+
+
+
     # ---- Slots / event handlers ---------------------------------------------
 
     def _on_tile_clicked(self, camera_id: str):
@@ -950,26 +1341,46 @@ class MultiCamWindow(QMainWindow):
         if ctx is None:
             return
 
-        # Store the latest frame for snapshots/calibration (RAW)
+        # Always keep the raw frame for snapshots/calibration
         ctx.latest_frame = frame
 
-        # Apply PTV overlay if we have a tracker
+        # Start with the raw frame for preview
         preview_frame = frame
+
+        # --- Optional: PTV overlay ----------------------------------------
         ptv = getattr(ctx, "ptv_tracker", None)
         if ptv is not None:
-            # process_frame(copy=True) keeps ctx.latest_frame raw
-            preview_frame = ptv.process_frame(frame, copy=True)
+            # process_frame(copy=True) returns a BGR copy with PTV traces drawn
+            preview_frame = ptv.process_frame(preview_frame, copy=True)
 
-        # Update the tile preview
+        # --- Live ChArUco overlay (only for active calibration camera) ----
+        # Show overlay only while calibration capture is active
+        if (
+            hasattr(self, "calib_panel")
+            and self.calib_panel is not None
+            and self.calib_panel.is_live_overlay_enabled()
+            and self.active_camera_id == camera_id
+        ):
+            try:
+                preview_frame = self.calib_panel.draw_live_charuco_overlay(preview_frame)
+            except Exception:
+                # Don't kill the GUI if overlay fails; just skip it
+                print("Overlay failed")
+                pass
+
+        # Finally, push the frame to the tile
         ctx.tile.update_frame(preview_frame)
+
 
 
 
     def _on_preview_fps_changed(self, value: float):
         ctx = self._current_context()
-        if ctx is None:
-            return
-        ctx.thread.set_preview_fps(value)
+        if ctx is not None:
+            ctx.thread.set_preview_fps(value)
+
+        # Persist the new global preview FPS
+        self._save_global_settings()
 
     def _on_toggle_ptv_all(self, checked: bool):
         """
@@ -981,7 +1392,8 @@ class MultiCamWindow(QMainWindow):
         for ctx in self.cameras.values():
             # Lazily create a tracker if we don't have one
             if ctx.ptv_tracker is None and checked:
-                ctx.ptv_tracker = PTVTracker(PTVConfig())
+                # All cameras share the same PTVConfig instance
+                ctx.ptv_tracker = PTVTracker(self.ptv_config)
 
             ptv = ctx.ptv_tracker
             if ptv is None:
@@ -1181,12 +1593,20 @@ class MultiCamWindow(QMainWindow):
 
     def _on_start_all(self):
         """Start recording on all cameras using global session settings."""
-        root_dir, base_id = self._session_params()
+        # Session ID text from UI
+        root_dir, base_text = self._session_params()
+        # Resolve to a unique session base with numeric suffix (_0001, _0002, ...)
+        base_id = self._next_session_base(root_dir, base_text)
+        # Remember this so snapshots & calibration can use the same session folder
+        self.current_session_base = base_id
+
         record_video = self.record_check.isChecked() if self.record_check else True
         snapshot_fps = float(self.snapshot_fps_spin.value()) if self.snapshot_fps_spin else 0.0
         video_fps = float(self.capture_fps_spin.value()) if self.capture_fps_spin else 30.0
         codec = self.codec_combo.currentData() if self.codec_combo else "XVID"
         codec = codec or "XVID"
+
+
 
         try:
             root_dir.mkdir(parents=True, exist_ok=True)
@@ -1195,13 +1615,14 @@ class MultiCamWindow(QMainWindow):
             return
 
         for ctx in self.cameras.values():
-            cam_dir = root_dir / base_id / ctx.camera_id
+            cam_token = self._friendly_cam_token(ctx)
+            cam_dir = root_dir / base_id / cam_token
             try:
                 cam_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
 
-            session_id = f"{base_id}_{ctx.camera_id}"
+            session_id = f"{base_id}_{cam_token}"
             ctx.session_dir = cam_dir
             ctx.session_id = session_id
             ctx.snapshot_fps = snapshot_fps
@@ -1278,14 +1699,24 @@ class MultiCamWindow(QMainWindow):
             return
 
         root_dir, base_id = self._session_params()
-        cam_dir = root_dir / base_id / ctx.camera_id
+
+        # If we're in an active session, reuse that; otherwise allocate a new one
+        if self.current_session_base:
+            base_id = self.current_session_base
+        else:
+            base_id = self._next_session_base(root_dir, base_text)
+            self.current_session_base = base_id
+
+        cam_token = self._friendly_cam_token(ctx)
+        cam_dir = root_dir / base_id / cam_token
         try:
             cam_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        snap_path = cam_dir / f"{base_id}_{ctx.camera_id}_snapshot_{timestamp}.png"
+        snap_path = cam_dir / f"{base_id}_{cam_token}_snapshot_{timestamp}.png"
+
 
         try:
             cv2.imwrite(str(snap_path), ctx.latest_frame)
