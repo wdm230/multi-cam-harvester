@@ -27,7 +27,7 @@ import time  # <-- NEW
 import cv2
 import numpy as np
 from harvesters.core import Harvester
-from genicam.gentl import TimeoutException
+from genicam.gentl import TimeoutException, GenericException
 
 
 @dataclass
@@ -102,15 +102,49 @@ class HarvesterCameraManager:
 
         ia = h.create(self._device_index)
 
-        # Force a known pixel format (Mono8) so display & recording behave.
+
+        remote = ia.remote_device.node_map
+        desired_fps = 10.0
+
+        # 1. Configure trigger: FrameStart at FixedRate
         try:
-            remote = ia.remote_device.node_map
-            pf = remote.PixelFormat
-            if "Mono8" in pf.symbolics:
-                pf.value = "Mono8"
-        except Exception:
-            # If this fails, we'll just use whatever the camera is already set to.
-            pass
+            trg_sel = getattr(remote, "TriggerSelector", None)
+            trg_src = getattr(remote, "TriggerSource", None)
+            trg_mode = getattr(remote, "TriggerMode", None)
+
+            if trg_sel is not None:
+                print("TriggerSelector options:", getattr(trg_sel, "symbolics", "?"))
+                # Select FrameStart if supported
+                if hasattr(trg_sel, "symbolics") and "FrameStart" in trg_sel.symbolics:
+                    trg_sel.value = "FrameStart"
+
+            if trg_src is not None:
+                print("TriggerSource options:", getattr(trg_src, "symbolics", "?"))
+                # Use FixedRate if supported
+                if hasattr(trg_src, "symbolics") and "FixedRate" in trg_src.symbolics:
+                    trg_src.value = "FixedRate"
+
+            if trg_mode is not None:
+                # Many cameras require TriggerMode = On for triggers to apply
+                print("TriggerMode options:", getattr(trg_mode, "symbolics", "?"))
+                if hasattr(trg_mode, "symbolics") and "On" in trg_mode.symbolics:
+                    trg_mode.value = "On"
+
+        except GenericException as e:
+            print("Error configuring trigger:", repr(e))
+
+        # 2. Now set the actual FPS
+        try:
+            afr = getattr(remote, "AcquisitionFrameRateAbs", None)
+            if afr is not None:
+                print("AcquisitionFrameRateAbs min/max:", afr.min, afr.max, "current:", afr.value)
+                target = max(afr.min, min(afr.max, desired_fps))
+                afr.value = target
+                print("AcquisitionFrameRateAbs after:", afr.value)
+            else:
+                print("No AcquisitionFrameRateAbs node")
+        except GenericException as e:
+            print("Failed to set AcquisitionFrameRateAbs:", repr(e))
 
         self._h = h
         self._ia = ia

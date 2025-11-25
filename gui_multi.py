@@ -337,7 +337,7 @@ class CameraTile(QWidget):
             pix = pix.scaled(
                 target_size,
                 Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
+                Qt.FastTransformation,
             )
 
         self.image_label.setPixmap(pix)
@@ -537,7 +537,7 @@ class MultiCamWindow(QMainWindow):
 
         # Snapshot FPS (per second)
         self.snapshot_fps_spin = QDoubleSpinBox()
-        self.snapshot_fps_spin.setRange(0.0, 120.0)
+        self.snapshot_fps_spin.setRange(0.0, 15.0)
         self.snapshot_fps_spin.setDecimals(1)
         self.snapshot_fps_spin.setSingleStep(0.5)
         self.snapshot_fps_spin.setValue(float(global_conf.get("snapshot_fps", 0.0)))
@@ -548,7 +548,7 @@ class MultiCamWindow(QMainWindow):
 
         # Recording FPS (video_fps)
         self.capture_fps_spin = QDoubleSpinBox()
-        self.capture_fps_spin.setRange(0.1, 120.0)
+        self.capture_fps_spin.setRange(0.1, 15.0)
         self.capture_fps_spin.setDecimals(1)
         self.capture_fps_spin.setSingleStep(1.0)
         self.capture_fps_spin.setValue(float(global_conf.get("capture_fps", 30.0)))
@@ -615,7 +615,7 @@ class MultiCamWindow(QMainWindow):
 
         # Preview FPS (works for real + sim)
         self.preview_fps_spin = QDoubleSpinBox()
-        self.preview_fps_spin.setRange(0.5, 60.0)
+        self.preview_fps_spin.setRange(0.1, 10)
         self.preview_fps_spin.setDecimals(1)
         self.preview_fps_spin.setSingleStep(0.5)
         self.preview_fps_spin.setValue(
@@ -1346,6 +1346,13 @@ class MultiCamWindow(QMainWindow):
 
         # Start with the raw frame for preview
         preview_frame = frame
+        h, w = preview_frame.shape[:2]
+        if max(h, w) > 1000:  # only if it's a big frame
+            preview_frame = cv2.resize(
+                preview_frame,
+                (int(w // 1.5), int(h // 1.5)),
+                interpolation=cv2.INTER_AREA,
+            )
 
         # --- Optional: PTV overlay ----------------------------------------
         ptv = getattr(ctx, "ptv_tracker", None)

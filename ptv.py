@@ -214,59 +214,56 @@ class PTVTracker:
     # Tracking
     # ------------------------------------------------------------------
     def _update_tracks(self, centroids: List[Point]) -> None:
-        """
-        Associate detected centroids with existing tracks, or start new ones.
-        """
+        if not centroids:
+            # No detections; just age tracks
+            for track in self.tracks:
+                track.missed_frames += 1
+            self._prune_stale_tracks()
+            return
+
+        centroids_arr = np.asarray(centroids, dtype=np.float32)  # shape (M, 2)
         used = set()
         max_d2 = self.config.max_dist_px * self.config.max_dist_px
 
-        # First, try to extend existing tracks
         for track in self.tracks:
             if track.last_pos is None:
                 track.missed_frames += 1
                 continue
 
             px, py = track.last_pos
-            best_j = None
-            best_d2 = max_d2
 
-            for j, (cx, cy) in enumerate(centroids):
-                if j in used:
-                    continue
-                dx = cx - px
-                dy = cy - py
-                d2 = dx * dx + dy * dy
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_j = j
+            # Mask out already-used centroids
+            mask = np.ones(len(centroids), dtype=bool)
+            if used:
+                used_idx = np.fromiter(used, dtype=int, count=len(used))
+                mask[used_idx] = False
 
-            if best_j is not None:
-                cx, cy = centroids[best_j]
+            if not mask.any():
+                track.missed_frames += 1
+                continue
+
+            # Vectorized distances
+            diffs = centroids_arr[mask] - np.array([px, py], dtype=np.float32)  # (K, 2)
+            d2s = np.einsum("ij,ij->i", diffs, diffs)  # (K,)
+
+            k = np.argmin(d2s)
+            best_d2 = d2s[k]
+            if best_d2 < max_d2:
+                # Map back from masked index to original centroid index
+                valid_indices = np.nonzero(mask)[0]
+                j = int(valid_indices[k])
+
+                cx, cy = centroids[j]
                 track.points.append((cx, cy))
                 track.last_pos = (cx, cy)
                 track.missed_frames = 0
-                used.add(best_j)
+                used.add(j)
             else:
                 track.missed_frames += 1
 
-            # Limit history length
+            # Limit history
             if len(track.points) > self.config.max_history:
-                track.points = track.points[-self.config.max_history :]
-
-        # Then, start new tracks for any unused centroids, up to max_tracks
-        for j, (cx, cy) in enumerate(centroids):
-            if j in used:
-                continue
-            if len(self.tracks) >= self.config.max_tracks:
-                break
-            t = Track(
-                id=self._next_id,
-                points=[(cx, cy)],
-                last_pos=(cx, cy),
-                missed_frames=0,
-            )
-            self.tracks.append(t)
-            self._next_id += 1
+                track.points = track.points[-self.config.max_history:]
 
     def _prune_stale_tracks(self) -> None:
         """

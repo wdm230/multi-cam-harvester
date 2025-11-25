@@ -39,29 +39,126 @@ class CalibrationWorker(QThread):
     Runs ChArUco calibration in a background thread.
 
     Emits:
-        result_ready(dict): {rms, camera_matrix, dist_coeffs, per_image_errors}
-        error(str): error message
+        result_ready(dict): {
+            rms, camera_matrix, dist_coeffs, per_image_errors, distortion_model
+        }
+        error(str): error message (traceback)
     """
     result_ready = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, board, all_corners, all_ids, image_size, parent=None):
+    def __init__(self, board, all_corners, all_ids, image_size,
+                 model: str = "pinhole", parent=None):
         super().__init__(parent)
         self._board = board
         self._all_corners = all_corners
         self._all_ids = all_ids
-        self._image_size = image_size
+        self._image_size = image_size  # (width, height)
+        self._model = model            # "pinhole" or "fisheye"
 
     def run(self):
         import cv2
         import cv2.aruco as aruco
         import numpy as np
+        import traceback
 
         try:
-            # Prefer Extended if available (gives per-view errors)
-            if hasattr(aruco, "calibrateCameraCharucoExtended"):
-                ret, K, D, rvecs, tvecs, stdInt, stdExt, perViewErrors = (
-                    aruco.calibrateCameraCharucoExtended(
+            if self._model == "fisheye":
+                # --------- FISHEYE MODEL -----------------------------------
+                img_size = self._image_size  # (w, h)
+                board = self._board
+
+                objpoints = []  # list of (Ni, 1, 3)
+                imgpoints = []  # list of (Ni, 1, 2)
+
+                # Get 3D Charuco corners from the board
+                all_obj_corners = board.getChessboardCorners()  # (Nsquares, 3)
+
+                for corners, ids in zip(self._all_corners, self._all_ids):
+                    if corners is None or ids is None:
+                        continue
+                    if len(corners) == 0:
+                        continue
+
+                    ids_flat = ids.flatten().astype(int)
+
+                    # 3D object points for this view
+                    obj = all_obj_corners[ids_flat]
+                    obj = obj.reshape(-1, 1, 3).astype(np.float64)
+
+                    # 2D image points for this view
+                    img = corners.reshape(-1, 1, 2).astype(np.float64)
+
+                    objpoints.append(obj)
+                    imgpoints.append(img)
+
+                if len(objpoints) < 3:
+                    raise RuntimeError(
+                        "Not enough valid views for fisheye calibration (need >= 3)."
+                    )
+
+                K = np.eye(3, dtype=np.float64)
+                D = np.zeros((4, 1), dtype=np.float64)
+
+                flags = (
+                    cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                    | cv2.fisheye.CALIB_CHECK_COND
+                    | cv2.fisheye.CALIB_FIX_SKEW
+                )
+                criteria = (
+                    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    100,
+                    1e-6,
+                )
+
+                rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                    objpoints,
+                    imgpoints,
+                    img_size,
+                    K,
+                    D,
+                    flags=flags,
+                    criteria=criteria,
+                )
+
+                # Per-image reprojection error for plotting
+                per_image_errors = []
+                for obj, img, rvec, tvec in zip(objpoints, imgpoints, rvecs, tvecs):
+                    proj, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, K, D)
+                    diff = proj - img
+                    err = np.linalg.norm(diff) / np.sqrt(len(obj))
+                    per_image_errors.append(float(err))
+
+                self.result_ready.emit(
+                    {
+                        "rms": float(rms),
+                        "camera_matrix": K,
+                        "dist_coeffs": D,
+                        "per_image_errors": per_image_errors,
+                        "distortion_model": "opencv_fisheye",
+                    }
+                )
+
+            else:
+                # --------- PINHOLE (RADIAL-TANGENTIAL) MODEL ----------------
+                # Prefer Extended if available (gives per-view errors)
+                if hasattr(aruco, "calibrateCameraCharucoExtended"):
+                    ret, K, D, rvecs, tvecs, stdInt, stdExt, perViewErrors = (
+                        aruco.calibrateCameraCharucoExtended(
+                            charucoCorners=self._all_corners,
+                            charucoIds=self._all_ids,
+                            board=self._board,
+                            imageSize=self._image_size,
+                            cameraMatrix=None,
+                            distCoeffs=None,
+                        )
+                    )
+
+                    perViewErrors = np.array(perViewErrors).reshape(-1)
+                    per_image_errors = [float(e) for e in perViewErrors]
+                else:
+                    # Older OpenCV: only a single RMS; fake per-image list
+                    ret, K, D, rvecs, tvecs = aruco.calibrateCameraCharuco(
                         charucoCorners=self._all_corners,
                         charucoIds=self._all_ids,
                         board=self._board,
@@ -69,34 +166,23 @@ class CalibrationWorker(QThread):
                         cameraMatrix=None,
                         distCoeffs=None,
                     )
+                    per_image_errors = [float(ret)] * len(self._all_corners)
+
+                self.result_ready.emit(
+                    {
+                        "rms": float(ret),
+                        "camera_matrix": K,
+                        "dist_coeffs": D,
+                        "per_image_errors": per_image_errors,
+                        "distortion_model": "opencv_radial_tangential",
+                    }
                 )
 
-                # perViewErrors is usually Nx1 or (N,), make it a flat list of floats
-                perViewErrors = np.array(perViewErrors).reshape(-1)
-                per_image_errors = [float(e) for e in perViewErrors]
-            else:
-                # Older bindings: no per-view errors, just a single RMS
-                ret, K, D, rvecs, tvecs = aruco.calibrateCameraCharuco(
-                    charucoCorners=self._all_corners,
-                    charucoIds=self._all_ids,
-                    board=self._board,
-                    imageSize=self._image_size,
-                    cameraMatrix=None,
-                    distCoeffs=None,
-                )
-                # Best we can do: same RMS for each used image
-                per_image_errors = [float(ret)] * len(self._all_corners)
+        except Exception:
+            tb = traceback.format_exc()
+            self.error.emit(tb)
 
-            self.result_ready.emit(
-                {
-                    "rms": float(ret),
-                    "camera_matrix": K,
-                    "dist_coeffs": D,
-                    "per_image_errors": per_image_errors,
-                }
-            )
-        except Exception as e:
-            self.error.emit(str(e))
+
 
 
 
@@ -289,13 +375,30 @@ class CalibrationPanel(QWidget):
         calib_box = QGroupBox("Calibration")
         calib_layout = QVBoxLayout()
 
+        # --- Model selector (pinhole vs fisheye) ----------------------
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(
+            [
+                "Pinhole (radial-tangential)",
+                "Fisheye (cv2.fisheye)",
+            ]
+        )
+        self._distortion_model = "opencv_radial_tangential"  # default
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model:"))
+        model_row.addWidget(self.model_combo)
+        model_row.addStretch(1)
+
+        calib_layout.addLayout(model_row)
+
+        # --- Buttons + summary / plot ---------------------------------
         self.calibrate_btn = QPushButton("Run calibration")
         self.export_btn = QPushButton("Export JSON")
         self.export_btn.setEnabled(False)
 
         self.summary_label = QLabel("No calibration run yet.")
 
-        # Matplotlib canvas for per-image errors
         self.fig, self.ax = plt.subplots(figsize=(4, 4))
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setMinimumHeight(450)
@@ -314,7 +417,7 @@ class CalibrationPanel(QWidget):
         self.calibrate_btn.clicked.connect(self._on_calibrate)
         self.export_btn.clicked.connect(self._on_export)
 
-        # Optional: keep things pushed up a bit
+                # Optional: keep things pushed up a bit
         layout.addStretch(1)
 
 
@@ -591,11 +694,6 @@ class CalibrationPanel(QWidget):
 
         h, w = gray.shape[:2]
 
-        # For *preview*, don't be strict about image size.
-        # Optionally just initialize _image_size the first time:
-        if self._image_size is None:
-            self._image_size = (w, h)
-        # But DO NOT early-return on mismatch here
 
         self._ensure_board()
         import cv2.aruco as aruco
@@ -788,7 +886,10 @@ class CalibrationPanel(QWidget):
         self._camera_matrix = result["camera_matrix"]
         self._dist_coeffs = result["dist_coeffs"]
         self._rms = result["rms"]
-        per_image_errors = result["per_image_errors"]
+
+        per_image_errors = result.get("per_image_errors", [])
+        distortion_model = result.get("distortion_model", "opencv_radial_tangential")
+        self._distortion_model = distortion_model  # so export uses it
 
         used_indices = self._last_used_indices or list(range(len(per_image_errors)))
 
@@ -798,11 +899,14 @@ class CalibrationPanel(QWidget):
 
         # Update table + plot
         self._update_table_errors()
-        self._update_error_plot(per_image_errors, used_indices)
+        if per_image_errors:
+            self._update_error_plot(per_image_errors, used_indices)
 
         self.summary_label.setText(
             f"Calibration RMS error: {self._rms:.4f} px (using {len(used_indices)} images)."
         )
+
+
 
     def _on_calibration_error(self, msg):
         """
@@ -818,8 +922,13 @@ class CalibrationPanel(QWidget):
         self.calibrate_btn.setEnabled(True)
         if self._camera_matrix is not None:
             self.export_btn.setEnabled(True)
+        else:
+            # If we somehow finished without a valid calibration and without an error
+            if self.summary_label.text().startswith("Running calibration"):
+                self.summary_label.setText("Calibration finished (no result).")
 
         self._calib_worker = None
+
 
 
     def _on_calibrate(self):
@@ -873,13 +982,18 @@ class CalibrationPanel(QWidget):
         self.export_btn.setEnabled(False)
 
         # Start worker thread
+        model_text = self.model_combo.currentText()
+        model = "fisheye" if "Fisheye" in model_text else "pinhole"
+
         self._calib_worker = CalibrationWorker(
             board=self._board,
             all_corners=all_corners,
             all_ids=all_ids,
             image_size=self._image_size,
+            model=model,
             parent=self,
         )
+
         self._calib_worker.result_ready.connect(self._on_calibration_result)
         self._calib_worker.error.connect(self._on_calibration_error)
         self._calib_worker.finished.connect(self._on_calibration_thread_finished)
@@ -957,7 +1071,7 @@ class CalibrationPanel(QWidget):
                 [float(K[1, 0]), float(K[1, 1]), float(K[1, 2])],
                 [float(K[2, 0]), float(K[2, 1]), float(K[2, 2])],
             ],
-            "distortion_model": "opencv_radial_tangential",
+            "distortion_model": getattr(self, "_distortion_model", "opencv_radial_tangential"),
             "distortion_coeffs": dist_list,
             "reprojection_error_rms": float(self._rms),
             "per_image_error_rms": [
